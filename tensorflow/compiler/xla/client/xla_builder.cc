@@ -213,16 +213,10 @@ void XlaBuilder::IsConstantVisitor(const int64 op_handle,
       // TODO(b/32495713): We aren't checking the called computations.
       break;
     case HloOpcode::kGetDimensionSize: {
-      int64 dimension_number = instr.dimensions(0);
-      const HloInstructionProto& operand =
-          *(LookUpInstructionByHandle(instr.operand_ids(0)).ValueOrDie());
-      Shape operand_shape(operand.shape());
-      if (operand_shape.is_dynamic_dimension(dimension_number)) {
-        *is_constant = false;
-      }
+      // DimensionSize is always considered constant in XLA -- If a dynamic
+      // dimension is presented, uint_max is returned.
       break;
     }
-
     // Non functional ops.
     case HloOpcode::kRng:
     case HloOpcode::kAllReduce:
@@ -268,8 +262,8 @@ Status XlaBuilder::SetDynamicBinding(int64 dynamic_size_param_num,
       for (int64 index : target_param_index) {
         param_shape_ptr = param_shape_ptr->mutable_tuple_shapes(index);
       }
-      // TODO(b/121223198): Set `is_dynamic` to the parameter shape when XLA
-      // backend can handle dynamic dimensions.
+      param_shape_ptr->set_dynamic_dimension(target_dim_num,
+                                             /*is_dynamic=*/true);
       *instr.mutable_shape() = param_shape.ToProto();
     }
   }
@@ -286,6 +280,15 @@ Status XlaBuilder::SetDynamicBinding(int64 dynamic_size_param_num,
                                                 dynamic_size_param_index},
       DynamicParameterBinding::DynamicDimension{
           target_param_num, target_param_index, target_dim_num}));
+  return Status::OK();
+}
+
+Status XlaBuilder::SetInstructionFrontendAttribute(const XlaOp op,
+                                                   std::string attribute,
+                                                   std::string value) {
+  TF_ASSIGN_OR_RETURN(auto instr_proto, LookUpMutableInstruction(op));
+  auto* frontend_attributes = instr_proto->mutable_frontend_attributes();
+  (*frontend_attributes->mutable_map())[attribute] = std::move(value);
   return Status::OK();
 }
 
@@ -426,6 +429,7 @@ StatusOr<XlaOp> XlaBuilder::InDimBroadcast(
   for (int64 dim : broadcast_dimensions) {
     instr.add_dimensions(dim);
   }
+
   return AddInstruction(std::move(instr), HloOpcode::kBroadcast, {operand});
 }
 
@@ -459,11 +463,21 @@ StatusOr<XlaOp> XlaBuilder::AddBroadcastSequence(const Shape& output_shape,
           << operand_shape << "; output_shape: " << output_shape;
     }
   }
+
+  Shape reshaped_shape =
+      ShapeUtil::MakeShape(operand_shape.element_type(), reshaped_dimensions);
+
+  std::vector<std::pair<int64, int64>> unmodified_dims =
+      ShapeUtil::DimensionsUnmodifiedByReshape(operand_shape, reshaped_shape);
+
+  for (auto& unmodified : unmodified_dims) {
+    if (operand_shape.is_dynamic_dimension(unmodified.first)) {
+      reshaped_shape.set_dynamic_dimension(unmodified.second, true);
+    }
+  }
+
   // Eliminate the size one dimensions.
-  TF_ASSIGN_OR_RETURN(XlaOp reshaped_operand,
-                      Reshape(ShapeUtil::MakeShape(operand_shape.element_type(),
-                                                   reshaped_dimensions),
-                              operand));
+  TF_ASSIGN_OR_RETURN(XlaOp reshaped_operand, Reshape(reshaped_shape, operand));
   // Broadcast 'reshape' up to the larger size.
   return InDimBroadcast(broadcast_shape, reshaped_operand,
                         broadcast_dimensions);
@@ -606,10 +620,22 @@ XlaOp XlaBuilder::TernaryOp(HloOpcode triop, const XlaOp& lhs, const XlaOp& rhs,
 
 XlaOp XlaBuilder::ConstantLiteral(const LiteralSlice& literal) {
   return ReportErrorOrReturn([&]() -> StatusOr<XlaOp> {
-    HloInstructionProto instr;
-    *instr.mutable_shape() = literal.shape().ToProto();
-    *instr.mutable_literal() = literal.ToProto();
-    return AddInstruction(std::move(instr), HloOpcode::kConstant);
+    if (literal.shape().IsArray() && literal.element_count() > 1 &&
+        literal.IsAllFirst()) {
+      Literal scalar = LiteralUtil::GetFirstScalarLiteral(literal);
+      HloInstructionProto instr;
+      *instr.mutable_shape() = scalar.shape().ToProto();
+      *instr.mutable_literal() = scalar.ToProto();
+      TF_ASSIGN_OR_RETURN(
+          XlaOp scalar_op,
+          AddInstruction(std::move(instr), HloOpcode::kConstant));
+      return Broadcast(scalar_op, literal.shape().dimensions());
+    } else {
+      HloInstructionProto instr;
+      *instr.mutable_shape() = literal.shape().ToProto();
+      *instr.mutable_literal() = literal.ToProto();
+      return AddInstruction(std::move(instr), HloOpcode::kConstant);
+    }
   });
 }
 
@@ -1725,10 +1751,12 @@ XlaOp XlaBuilder::Scatter(const XlaOp& input, const XlaOp& scatter_indices,
                           const XlaOp& updates,
                           const XlaComputation& update_computation,
                           const ScatterDimensionNumbers& dimension_numbers,
-                          bool indices_are_sorted) {
+                          bool indices_are_sorted, bool unique_indices) {
   return ReportErrorOrReturn([&]() -> StatusOr<XlaOp> {
     HloInstructionProto instr;
     instr.set_indices_are_sorted(indices_are_sorted);
+
+    instr.set_unique_indices(unique_indices);
 
     TF_ASSIGN_OR_RETURN(const Shape& input_shape, GetShape(input));
     TF_ASSIGN_OR_RETURN(const Shape& scatter_indices_shape,
@@ -2405,7 +2433,7 @@ StatusOr<bool> XlaBuilder::IsConstant(const XlaOp& operand) const {
 }
 
 StatusOr<XlaComputation> XlaBuilder::BuildConstantSubGraph(
-    const XlaOp& root_op) {
+    XlaOp root_op, bool dynamic_dimension_is_minus_one) {
   TF_ASSIGN_OR_RETURN(bool is_constant, IsConstant(root_op));
   if (!is_constant) {
     auto op_status = LookUpInstruction(root_op);
@@ -2460,9 +2488,12 @@ StatusOr<XlaComputation> XlaBuilder::BuildConstantSubGraph(
       TF_ASSIGN_OR_RETURN(const HloInstructionProto* operand_proto,
                           LookUpInstructionByHandle(operand_handle));
 
-      TF_RET_CHECK(!operand_proto->shape().is_dynamic_dimension(dimension));
-      auto constant_dimension_size =
-          static_cast<uint32>(operand_proto->shape().dimensions(dimension));
+      int32 constant_dimension_size = -1;
+      if (!(operand_proto->shape().is_dynamic_dimension(dimension) &&
+            dynamic_dimension_is_minus_one)) {
+        constant_dimension_size =
+            static_cast<int32>(operand_proto->shape().dimensions(dimension));
+      }
 
       Literal literal = LiteralUtil::CreateR0(constant_dimension_size);
 
@@ -2626,6 +2657,7 @@ StatusOr<XlaOp> XlaBuilder::AddInstruction(HloInstructionProto&& instr,
   if (sharding_) {
     *instr.mutable_sharding() = *sharding_;
   }
+  *instr.mutable_frontend_attributes() = frontend_attributes_;
 
   handle_to_index_[handle] = instructions_.size();
   instructions_.push_back(std::move(instr));
@@ -2683,32 +2715,67 @@ void XlaBuilder::AddCalledComputation(const XlaComputation& computation,
   }
 }
 
-StatusOr<const HloInstructionProto*> XlaBuilder::LookUpInstruction(
-    const XlaOp& op) const {
-  TF_RETURN_IF_ERROR(first_error_);
+namespace {
 
-  if (op.builder_ == nullptr) {
+template <typename InstructionType>
+StatusOr<InstructionType> LookUpInstructionByHandleInternal(
+    const absl::flat_hash_map<int64, int64>& handle_to_index,
+    const std::vector<HloInstructionProto>& instructions, int64 handle) {
+  auto it = handle_to_index.find(handle);
+  if (it == handle_to_index.end()) {
+    return InvalidArgument("No XlaOp with handle %d", handle);
+  }
+  return const_cast<InstructionType>(&instructions.at(it->second));
+}
+
+template <typename InstructionType, typename OpBuilderType,
+          typename BuilderType, typename OpType>
+StatusOr<InstructionType> LookUpInstructionInternal(
+    const absl::flat_hash_map<int64, int64>& handle_to_index,
+    const std::vector<HloInstructionProto>& instructions,
+    OpBuilderType op_builder, BuilderType builder, OpType op_handle) {
+  if (op_builder == nullptr) {
     return InvalidArgument(
         "invalid XlaOp with handle %d; the builder of this op is freed",
-        op.handle());
+        op_handle);
   }
-  if (op.builder_ != this) {
+  if (op_builder != builder) {
     return InvalidArgument(
         "XlaOp with handle %d is built by builder '%s', but is trying to use "
         "it in builder '%s'",
-        op.handle(), op.builder_->name(), this->name());
+        op_handle, op_builder->name(), builder->name());
   }
 
-  return LookUpInstructionByHandle(op.handle());
+  return LookUpInstructionByHandleInternal<InstructionType>(
+      handle_to_index, instructions, op_handle);
+}
+
+}  // namespace
+
+StatusOr<const HloInstructionProto*> XlaBuilder::LookUpInstruction(
+    const XlaOp op) const {
+  TF_RETURN_IF_ERROR(first_error_);
+  return LookUpInstructionInternal<const HloInstructionProto*>(
+      handle_to_index_, instructions_, op.builder_, this, op.handle());
 }
 
 StatusOr<const HloInstructionProto*> XlaBuilder::LookUpInstructionByHandle(
     int64 handle) const {
-  auto it = handle_to_index_.find(handle);
-  if (it == handle_to_index_.end()) {
-    return InvalidArgument("No XlaOp with handle %d", handle);
-  }
-  return &instructions_[it->second];
+  return LookUpInstructionByHandleInternal<const HloInstructionProto*>(
+      handle_to_index_, instructions_, handle);
+}
+
+StatusOr<HloInstructionProto*> XlaBuilder::LookUpMutableInstruction(
+    const XlaOp op) {
+  TF_RETURN_IF_ERROR(first_error_);
+  return LookUpInstructionInternal<HloInstructionProto*>(
+      handle_to_index_, instructions_, op.builder_, this, op.handle());
+}
+
+StatusOr<HloInstructionProto*> XlaBuilder::LookUpMutableInstructionByHandle(
+    int64 handle) {
+  return LookUpInstructionByHandleInternal<HloInstructionProto*>(
+      handle_to_index_, instructions_, handle);
 }
 
 // Enqueues a "retrieve parameter value" instruction for a parameter that was
@@ -3333,10 +3400,10 @@ XlaOp Gather(const XlaOp input, const XlaOp start_indices,
 XlaOp Scatter(const XlaOp input, const XlaOp scatter_indices,
               const XlaOp updates, const XlaComputation& update_computation,
               const ScatterDimensionNumbers& dimension_numbers,
-              bool indices_are_sorted) {
+              bool indices_are_sorted, bool unique_indices) {
   return input.builder()->Scatter(input, scatter_indices, updates,
                                   update_computation, dimension_numbers,
-                                  indices_are_sorted);
+                                  indices_are_sorted, unique_indices);
 }
 
 void Send(const XlaOp operand, const ChannelHandle& handle) {
